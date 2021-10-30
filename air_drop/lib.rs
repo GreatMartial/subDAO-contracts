@@ -4,7 +4,6 @@ use ink_lang as ink;
 
 #[ink::contract]
 mod air_drop {
-    use ink_lang::EmitEvent;
     #[cfg(not(feature = "ink-as-dependency"))]
     use ink_storage::{
         traits::{
@@ -25,50 +24,50 @@ mod air_drop {
         token_standard_addr: AccountId,
     }
     
+    #[derive(Debug, Clone, scale::Encode, scale::Decode, SpreadLayout, PackedLayout)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink_storage::traits::StorageLayout)
+    )]
+    pub struct AirDropInfo {
+        index: u64,
+    }
+
     #[ink(storage)]
     pub struct AirDropManager {
-        /// token standard name and contract code hash
         owner: Option<AccountId>,
         index: u64,
-        token_standard_map: StorageHashMap<u64, TokenStandardIns>,
-    }
-
-/*     #[ink(event)]
-    pub struct AirDropTransfer {
-        #[ink(topic)]
-        from: Option<AccountId>,
-        #[ink(topic)]
-        to: Option<AccountId>,
-        #[ink(topic)]
-        value: u64,
+        // the list of token standard ins address
+        token_standard_map: StorageHashMap<AccountId, u64>,
     }
 
     #[ink(event)]
-    pub struct AirDropApproval {
+    pub struct RegisterTokenStandardIns {
         #[ink(topic)]
         owner: AccountId,
-        #[ink(topic)]
-        spender: AccountId,
-        #[ink(topic)]
-        value: u64,
+        index: u64,
     }
 
-    #[ink(event)]
-    pub struct AirDropInstance {
-        #[ink(topic)]
-        token_standard_name: Option<String>,
-    }
-*/
     #[ink(event)]
     pub struct AirDropTransfer {
         #[ink(topic)]
         from: Option<AccountId>,
-        #[ink(topic)]
+        // token standard instance count
+        token_standard_ins_count: u64,
         count: u64,
-        #[ink(topic)]
         // By default, the funds transferred from the airdrop to each address are the same. 
         value: u64,
     }
+
+    #[derive(Debug, PartialEq, Eq, scale::Encode, scale::Decode)]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub enum Error {
+        RegisterTokenStandardInsError,
+        TokenStandardInsNotFound,
+    }
+
+    // result type
+    pub type Result<T> = core::result::Result<T, Error>;
 
     impl AirDropManager {
         #[ink(constructor)]
@@ -82,139 +81,91 @@ mod air_drop {
         }
 
         #[ink(message)]
-        pub fn create_token_standard_ins(&mut self, token_addr: AccountId) -> u64 {
+        pub fn register_token_standard_ins(&mut self, token_standard_ins: AccountId) -> Result<()> {
             self.owner = Some(self.env().caller());
             self.index += 1;
 
-            let token_standard_ins = TokenStandardIns{token_standard_addr: token_addr,};
-            self.token_standard_map.insert(self.index, token_standard_ins);
+            self.token_standard_map.insert(token_standard_ins, self.index);
 
-            self.index
+            // trigger event
+            self.env().emit_event(RegisterTokenStandardIns {
+                owner: self.owner.clone().unwrap(),
+                index: self.index,
+            });
+            Ok(())
         }
 
         #[ink(message)]
-        pub fn action(&mut self, token_addr: AccountId, air_drop_list: BTreeMap<AccountId, u64>) -> bool {
-            let mut token: Erc20 = ink_env::call::FromAccountId::from_account_id(token_addr);
+        pub fn action(&mut self, token_standard_ins: AccountId, air_drop_list: BTreeMap<AccountId, u64>) -> Result<()> {
+            // Determine whether the contract is registered
+            let _index = self.token_standard_map.get(&token_standard_ins).ok_or(Error::TokenStandardInsNotFound)?;
+
+            let mut token: Erc20 = ink_env::call::FromAccountId::from_account_id(token_standard_ins);
             let count = air_drop_list.len() as u64;
-            for (to, value) in air_drop_list {
+            let mut value: u64 = 0;
+
+            for (to, v) in air_drop_list {
+                value = v;
                 token.transfer(to, value);
             }
 
+            // trigger event
             self.env().emit_event(AirDropTransfer {
                 from: self.owner,
+                token_standard_ins_count: 1,
                 count,
-                value: 0
+                value,
             });
-            true
+            Ok(())
         }
 
         #[ink(message)]
-        pub fn action_all(&mut self, air_drop_list: BTreeMap<AccountId, u64>) -> bool { 
-            for (_, token_standard_ins) in self.token_standard_map.into_iter() {
-                let mut token: Erc20 = ink_env::call::FromAccountId::from_account_id(token_standard_ins.token_standard_addr);
-                for (to, value) in &air_drop_list {
-                    token.transfer(*to, *value);
+        pub fn action_all(&mut self, air_drop_list: BTreeMap<AccountId, u64>) -> Result<()> { 
+            let token_standard_ins_count = self.token_standard_map.len() as u64;
+            let count = air_drop_list.len() as u64;
+            let mut value = 0;
+            let _from = self.env().caller();
+
+            for (token_standard_ins, _) in self.token_standard_map.into_iter() {
+                let mut token: Erc20 = ink_env::call::FromAccountId::from_account_id(*token_standard_ins);
+                for (to, v) in &air_drop_list {
+                    let to = *to;
+                    value = *v;
+                    token.transfer(to, value);
                 }
             }
-            true
-        }
-    }
-
-/* 
-    impl AirDrop {
-        // new function
-        #[ink(constructor)]
-        pub fn new(
-            token_standard: String,
-            erc20_code_hash: Hash,
-            name: String,
-            symbol: String,
-            initial_supply: u64, 
-            decimals: u8, 
-            controller: AccountId
-        ) -> Self {
-            let owner = Self::env().caller();
-            let total_balance = Self::env().balance();
-            let mut info = TokenStandardInstance{ erc20: None };
-            let token_standard_name: String;
-            // match &token_standard.to_string()[..] {
-            match &token_standard.to_string()[..] {    
-                "erc20" | "ERC20" => {
-                    let erc20_instance = Erc20::new(name, symbol, initial_supply, decimals, controller)
-                        .endowment(total_balance / 4)
-                        .code_hash(erc20_code_hash)
-                        //.salt_bytes(1_i32.to_le_bytes())
-                        .instantiate()
-                        .expect("failed at instantiating the `Erc20` contract.");
-                        info.erc20 = Some(erc20_instance);
-
-                        token_standard_name = "ERC20".to_string();
-                },
-                // "erc721" | "ERC721" => {
-                //    TODO:
-                // },
-                _ => {
-                    // TODO:
-                },
-            }    
             // trigger event
-            self.env().emit_event(AirDropInstance {
-                token_standard_name: Some(token_standard_name),
+            self.env().emit_event(AirDropTransfer {
+                from: self.owner,
+                token_standard_ins_count,
+                count,
+                value,
             });
-            //info.insert(token_standard, token_standard_instance);
-            Self { owner, info }  
+            Ok(())
         }
 
-        // query airDrop info
+        
         #[ink(message)]
-        pub fn get(&self, account_id: AccountId) -> u64 {
-            if let Some(er20_instance) = self.info.erc20.clone() {
-                return er20_instance.balance_of(account_id);
+        pub fn get(&self) -> AirDropInfo {
+            AirDropInfo {
+                // owner: self.owner.clone().unwrap(),
+                index: self.index,
             }
-            0
-        }
-
-        // do function
-        #[ink(message)]
-        pub fn invoke_list(&mut self, _token_standard: String, address_list: BTreeMap<AccountId, u64>) -> bool {
-            if let Some(mut erc20_instance) = self.info.erc20.clone() {
-                let mut total_value = 0 as u64;
-                for (_, value) in &address_list {
-                    total_value += value
-                }
-
-                erc20_instance.approve_from(self.env().caller(), self.env().account_id(), total_value);
-
-                let count: u64;
-                let amount: u64;
-                for (spender, value) in &address_list {
-                    let spender = *spender;
-                    let value = *value;
-                    count += 1;
-
-                    ink_env::debug_println!("wasm contract is air_drop: address {:?}, value {}", spender, value);
-                    erc20_instance.transfer_from(self.env().caller(), spender, value);
-                }
-                // ink_env::debug_println!("wasm contract is air_drop: contract_id {:?}", self.env().account_id());
-
-                // trigger event
-                self.env().emit_event(AirDropTransfer {
-                    from: Some(self.env().caller()),
-                    count,
-                    value: amount,
-
-                });
-                return true;
-            }
-                // TODO: erc721 tranfer
-                // if let Some(erc721_instance) = v.erc721 {
-                    // for (spender, value) in address_list {
-                        // erc721_instancev.transfer_from(Self.env().caller(), spender, value)
-                    // }
-                // }
-            false    
         }
     }
-    */
-}
 
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use ink_lang as ink;
+
+        #[ink::test]
+        fn test_register_token_standard_ins() {
+            // let accounts = ink_env::test::default_accounts::<ink_env::DefaultEnvironment>().expect("Cannot get accounts");
+            let mut manager = AirDropManager::new();
+
+            assert!(manager.register_token_standard_ins(AccountId::from([0x00; 32])).is_ok());
+        }
+    }
+
+}
