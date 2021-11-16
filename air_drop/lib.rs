@@ -14,6 +14,7 @@ mod air_drop {
     };
     use erc20::Erc20;
     use ink_prelude::collections::BTreeMap;
+    use ink_prelude::vec::Vec;
 
     #[derive(Debug, Clone, scale::Encode, scale::Decode, SpreadLayout, PackedLayout)]
     #[cfg_attr(
@@ -30,13 +31,25 @@ mod air_drop {
         derive(scale_info::TypeInfo, ink_storage::traits::StorageLayout)
     )]
     pub struct AirDropInfo {
-        index: u64,
+        owner: Option<AccountId>,
+        count: u64,
+    }
+
+    #[derive(Debug, Clone, scale::Encode, scale::Decode, SpreadLayout, PackedLayout)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink_storage::traits::StorageLayout)
+    )]
+    pub enum AirDropRespStatus {
+        Success,
+        Failed,
+        Interrupt,
     }
 
     #[ink(storage)]
     pub struct AirDropManager {
         owner: Option<AccountId>,
-        index: u64,
+        count: u64,
         // the list of token standard ins address
         token_standard_map: StorageHashMap<AccountId, u64>,
     }
@@ -46,6 +59,7 @@ mod air_drop {
         #[ink(topic)]
         owner: AccountId,
         index: u64,
+        token_standard_info: AccountId,
     }
 
     #[ink(event)]
@@ -54,16 +68,22 @@ mod air_drop {
         from: Option<AccountId>,
         // token standard instance count
         token_standard_ins_count: u64,
-        count: u64,
-        // By default, the funds transferred from the airdrop to each address are the same. 
-        value: u64,
+        transfer_address_count: u64,
+        // the total value of air drop token
+        total_value: u64,
+        response_status: BTreeMap<AccountId, AirDropRespStatus>,
+        unsuccessful_transfer_address_map: BTreeMap<AccountId, Vec<AccountId>>,
+
     }
 
     #[derive(Debug, PartialEq, Eq, scale::Encode, scale::Decode)]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
     pub enum Error {
-        RegisterTokenStandardInsError,
+        RepeatRegisterTokenStandardIns,
+        // RegisterTokenStandardInsError,
         TokenStandardInsNotFound,
+        AirDropAccountBalanceInsufficient,
+        TransferError,
     }
 
     // result type
@@ -73,8 +93,8 @@ mod air_drop {
         #[ink(constructor)]
         pub fn new() -> Self {
             let instance = Self {
-                owner: None,
-                index: 0,
+                owner: Some(Self::env().caller()),
+                count: 0,
                 token_standard_map: StorageHashMap::new() 
             };
             instance
@@ -82,15 +102,19 @@ mod air_drop {
 
         #[ink(message)]
         pub fn register_token_standard_ins(&mut self, token_standard_ins: AccountId) -> Result<()> {
-            self.owner = Some(self.env().caller());
-            self.index += 1;
-
-            self.token_standard_map.insert(token_standard_ins, self.index);
+            // self.owner = Some(self.env().caller());
+            // Determine whether the instance is registered repeatedly
+            if self.token_standard_map.contains_key(&token_standard_ins) {
+                return Err(Error::RepeatRegisterTokenStandardIns);
+            }
+            self.count += 1;
+            self.token_standard_map.insert(token_standard_ins, self.count - 1);
 
             // trigger event
             self.env().emit_event(RegisterTokenStandardIns {
-                owner: self.owner.clone().unwrap(),
-                index: self.index,
+                owner: self.owner.clone().unwrap_or(AccountId::from([0x00; 32])),
+                index: self.count - 1,
+                token_standard_info: token_standard_ins,
             });
             Ok(())
         }
@@ -98,23 +122,50 @@ mod air_drop {
         #[ink(message)]
         pub fn action(&mut self, token_standard_ins: AccountId, air_drop_list: BTreeMap<AccountId, u64>) -> Result<()> {
             // Determine whether the contract is registered
-            let _index = self.token_standard_map.get(&token_standard_ins).ok_or(Error::TokenStandardInsNotFound)?;
+            if self.token_standard_map.contains_key(&token_standard_ins) {
+                return Err(Error::TokenStandardInsNotFound);
+            }
 
             let mut token: Erc20 = ink_env::call::FromAccountId::from_account_id(token_standard_ins);
             let count = air_drop_list.len() as u64;
-            let mut value: u64 = 0;
+            // let mut value: u64 = 0;
+            let mut total_value: u64 = 0;
+            let mut response_status: BTreeMap<AccountId, AirDropRespStatus> = BTreeMap::new();
+            let mut unsuccessful_transfer_address_list: Vec<AccountId> = Vec::new();
+            let mut unsuccessful_transfer_address_map: BTreeMap<AccountId, Vec<AccountId>> = BTreeMap::new();
 
-            for (to, v) in air_drop_list {
-                value = v;
-                token.transfer(to, value);
+            // compute the total value of the airdrop 
+            for (_, v) in &air_drop_list {
+                total_value += *v;
+            }
+            if total_value < token.balance_of(self.env().account_id()) {
+                return Err(Error::AirDropAccountBalanceInsufficient);
             }
 
+            // invoke air_drop
+            for (to, value) in &air_drop_list {
+                let result = token.transfer(*to, *value);
+                if !result {
+                    // Record the address where the airdrop failed
+                    unsuccessful_transfer_address_list.push(*to);
+                }
+            }
+            unsuccessful_transfer_address_map.insert(token_standard_ins, unsuccessful_transfer_address_list);
+
+            match response_status.get(&token_standard_ins) {
+                Some(AirDropRespStatus::Interrupt) => {},
+                _ => {
+                    response_status.insert(token_standard_ins, AirDropRespStatus::Success);
+                },
+            }
             // trigger event
             self.env().emit_event(AirDropTransfer {
-                from: self.owner,
+                from: Some(self.env().account_id()),
                 token_standard_ins_count: 1,
-                count,
-                value,
+                transfer_address_count: count,
+                total_value,
+                response_status,
+                unsuccessful_transfer_address_map,
             });
             Ok(())
         }
@@ -123,23 +174,50 @@ mod air_drop {
         pub fn action_all(&mut self, air_drop_list: BTreeMap<AccountId, u64>) -> Result<()> { 
             let token_standard_ins_count = self.token_standard_map.len() as u64;
             let count = air_drop_list.len() as u64;
-            let mut value = 0;
-            let _from = self.env().caller();
+            // let mut value: u64 = 0;
+            let mut total_value: u64 = 0;
+            let mut response_status: BTreeMap<AccountId, AirDropRespStatus> = BTreeMap::new();
+            let mut unsuccessful_transfer_address_map: BTreeMap<AccountId, Vec<AccountId>> = BTreeMap::new();
 
             for (token_standard_ins, _) in self.token_standard_map.into_iter() {
                 let mut token: Erc20 = ink_env::call::FromAccountId::from_account_id(*token_standard_ins);
-                for (to, v) in &air_drop_list {
-                    let to = *to;
-                    value = *v;
-                    token.transfer(to, value);
+                let mut unsuccessful_transfer_address_list: Vec<AccountId> = Vec::new();
+
+                // compute the total value of the airdrop 
+                for (_, value) in &air_drop_list {
+                    total_value += *value;
+                }
+
+                if total_value < token.balance_of(self.env().account_id()) {
+                    return Err(Error::AirDropAccountBalanceInsufficient);
+                }
+
+                // invoke air_drop
+                for (to, value) in &air_drop_list {
+                    let result = token.transfer(*to, *value);
+                    if !result {
+                        // Record the address where the airdrop failed
+                        unsuccessful_transfer_address_list.push(*to);
+                    }
+                }
+                unsuccessful_transfer_address_map.insert(*token_standard_ins, unsuccessful_transfer_address_list);
+
+                match response_status.get(&token_standard_ins) {
+                    Some(AirDropRespStatus::Interrupt) => {},
+                    _ => {
+                        response_status.insert(*token_standard_ins, AirDropRespStatus::Success);
+                    },
                 }
             }
+
             // trigger event
             self.env().emit_event(AirDropTransfer {
-                from: self.owner,
+                from: Some(self.env().account_id()),
                 token_standard_ins_count,
-                count,
-                value,
+                transfer_address_count: count,
+                total_value,
+                response_status,
+                unsuccessful_transfer_address_map,
             });
             Ok(())
         }
@@ -148,8 +226,8 @@ mod air_drop {
         #[ink(message)]
         pub fn get(&self) -> AirDropInfo {
             AirDropInfo {
-                // owner: self.owner.clone().unwrap(),
-                index: self.index,
+                owner: self.owner,
+                count: self.count,
             }
         }
     }
